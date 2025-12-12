@@ -1,0 +1,12 @@
+[Unit]
+Description=LCD35 framebuffer watchdog
+After=systemd-modules-load.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/lcd35-watchdog.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
