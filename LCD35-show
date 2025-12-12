@@ -1,157 +1,300 @@
 #!/bin/bash
+# Enhanced installer for the LCD35 display with verification and recovery hooks.
 
-sudo ./system_backup.sh
+LOG_FILE="/var/log/lcd35-init.log"
+mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null
 
-if [ -f /etc/X11/xorg.conf.d/40-libinput.conf ]; then
-sudo rm -rf /etc/X11/xorg.conf.d/40-libinput.conf
-fi
-if [ ! -d /etc/X11/xorg.conf.d ]; then
-sudo mkdir -p /etc/X11/xorg.conf.d
-fi
-sudo cp ./usr/tft35a-overlay.dtb /boot/overlays/
-sudo cp ./usr/tft35a-overlay.dtb /boot/overlays/tft35a.dtbo
-#root_dev=`grep -oPr "root=[^\s]*" /boot/cmdline.txt | awk -F= '{printf $NF}'`
-#if test "$root_dev" = "/dev/mmcblk0p7";then
-#sudo cp -rf ./boot/config-noobs-nomal.txt ./boot/config.txt.bak
-#else
-#sudo cp -rf ./boot/config-nomal.txt ./boot/config.txt.bak
-#sudo echo "hdmi_force_hotplug=1" >> ./boot/config.txt.bak
-#fi
+usage() {
+  cat <<'USAGE'
+Usage: LCD35-show [rotation] [--verify] [--dry-run] [--uninstall] [--recalibrate]
 
-source ./system_config.sh
-#sudo sed -i -e 's/dtoverlay=vc4-kms-v3d/#dtoverlay=vc4-kms-v3d/' ./boot/config.txt.bak
-sudo echo "hdmi_force_hotplug=1" >> ./boot/config.txt.bak
-sudo echo "dtparam=i2c_arm=on" >> ./boot/config.txt.bak
-sudo echo "dtparam=spi=on" >> ./boot/config.txt.bak
-sudo echo "enable_uart=1" >> ./boot/config.txt.bak
-sudo echo "dtoverlay=tft35a:rotate=90" >> ./boot/config.txt.bak
-sudo echo "hdmi_group=2" >> ./boot/config.txt.bak
-sudo echo "hdmi_mode=1" >> ./boot/config.txt.bak
-sudo echo "hdmi_mode=87" >> ./boot/config.txt.bak
-sudo echo "hdmi_cvt 480 320 60 6 0 0 0" >> ./boot/config.txt.bak
-sudo echo "hdmi_drive=2" >> ./boot/config.txt.bak
-sudo cp -rf ./boot/config.txt.bak /boot/config.txt
+rotation       Optional rotation parameter passed to rotate.sh
+--verify       Only run framebuffer/X verification without making changes
+--dry-run      Show the actions that would be taken without applying them
+--uninstall    Restore HDMI output and disable LCD35 services
+--recalibrate  Launch the interactive LCD35-calibrate-touch utility
+USAGE
+}
 
-sudo cp -rf ./usr/99-calibration.conf-35-90  /etc/X11/xorg.conf.d/99-calibration.conf
-if [[ "$deb_version" < "12.1" ]]; then
-sudo cp -rf ./usr/99-fbturbo.conf  /usr/share/X11/xorg.conf.d/99-fbturbo.conf
+log() {
+  echo "$(date -Iseconds) [LCD35-show] $1" | tee -a "$LOG_FILE" > /dev/null
+}
+
+require_root() {
+  if [ "$EUID" -ne 0 ]; then
+    echo "Please run as root (sudo LCD35-show)." >&2
+    exit 1
+  fi
+}
+
+check_spi_enabled() {
+  if grep -q "^[[:space:]]*dtparam=spi=on" /boot/config.txt 2>/dev/null; then
+    log "SPI already enabled in /boot/config.txt"
+    return 0
+  fi
+  log "Enabling SPI in /boot/config.txt"
+  echo "dtparam=spi=on" | tee -a /boot/config.txt >/dev/null
+}
+
+write_test_pattern() {
+  if [ ! -e /dev/fb1 ]; then
+    log "Framebuffer /dev/fb1 is missing"
+    return 1
+  fi
+
+  local tmp
+  tmp=$(mktemp)
+  # Simple color stripes
+  dd if=/dev/zero of="$tmp" bs=1 count=153600 status=none 2>/dev/null
+  printf '\xFF\x00' | dd of="$tmp" bs=2 count=76800 seek=0 conv=notrunc status=none 2>/dev/null
+  if dd if="$tmp" of=/dev/fb1 bs=153600 count=1 conv=fsync status=none 2>/dev/null; then
+    rm -f "$tmp"
+    log "Wrote test pattern to /dev/fb1"
+    return 0
+  fi
+  rm -f "$tmp"
+  log "Failed to write test pattern to /dev/fb1"
+  return 1
+}
+
+verify_display_once() {
+  if [ ! -e /dev/fb1 ]; then
+    log "Verification: /dev/fb1 missing"
+    return 1
+  fi
+  if [ ! -w /dev/fb1 ]; then
+    log "Verification: /dev/fb1 not writable"
+    return 1
+  fi
+  write_test_pattern
+}
+
+attempt_recover_stack() {
+  if command -v /usr/local/bin/LCD35-recover >/dev/null 2>&1; then
+    /usr/local/bin/LCD35-recover >> "$LOG_FILE" 2>&1
+  elif [ -x ./LCD35-recover ]; then
+    ./LCD35-recover >> "$LOG_FILE" 2>&1
+  fi
+}
+
+verify_display_with_retries() {
+  local attempt
+  for attempt in 1 2 3; do
+    log "Display verification attempt ${attempt}"
+    if verify_display_once; then
+      log "Display responded on attempt ${attempt}"
+      return 0
+    fi
+    attempt_recover_stack
+    sleep 1
+  done
+  echo "Display initialization failed - try power cycle" >&2
+  return 1
+}
+
+perform_uninstall() {
+  log "Restoring HDMI configuration"
+  if [ -x ./system_restore.sh ]; then
+    ./system_restore.sh
+  fi
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl disable --now lcd35-watchdog.service >/dev/null 2>&1 || true
+    systemctl disable --now lcd35-preinit.service >/dev/null 2>&1 || true
+  fi
+  echo "Uninstall complete. Reboot recommended."
+}
+
+perform_verification() {
+  verify_display_with_retries
+}
+
+install_files() {
+  log "Backing up current configuration"
+  ./system_backup.sh
+
+  if [ -f /etc/X11/xorg.conf.d/40-libinput.conf ]; then
+    rm -rf /etc/X11/xorg.conf.d/40-libinput.conf
+  fi
+  mkdir -p /etc/X11/xorg.conf.d
+
+  cp ./usr/tft35a-overlay.dtb /boot/overlays/
+  cp ./usr/tft35a-overlay.dtb /boot/overlays/tft35a.dtbo
+
+  source ./system_config.sh
+
+  echo "hdmi_force_hotplug=1" >> ./boot/config.txt.bak
+  echo "dtparam=i2c_arm=on" >> ./boot/config.txt.bak
+  echo "dtparam=spi=on" >> ./boot/config.txt.bak
+  echo "enable_uart=1" >> ./boot/config.txt.bak
+  echo "dtoverlay=tft35a:rotate=90" >> ./boot/config.txt.bak
+  echo "hdmi_group=2" >> ./boot/config.txt.bak
+  echo "hdmi_mode=1" >> ./boot/config.txt.bak
+  echo "hdmi_mode=87" >> ./boot/config.txt.bak
+  echo "hdmi_cvt 480 320 60 6 0 0 0" >> ./boot/config.txt.bak
+  echo "hdmi_drive=2" >> ./boot/config.txt.bak
+  cp -rf ./boot/config.txt.bak /boot/config.txt
+
+  cp -rf ./usr/99-calibration.conf-35-90  /etc/X11/xorg.conf.d/99-calibration.conf
+  if [[ "$deb_version" < "12.1" ]]; then
+    cp -rf ./usr/99-fbturbo.conf  /usr/share/X11/xorg.conf.d/99-fbturbo.conf
+  fi
+
+  if [[ "$deb_version" = "13.1" ]] || [[ "$deb_version" > "13.1" ]]; then
+    cp -rf ./usr/99-fbturbo-fbcp.conf  /usr/share/X11/xorg.conf.d/99-fbturbo.conf
+    cp -rf ./etc/.bash_profile /home/$username/
+  fi
+
+  if [[ "$deb_version" < "13.1" ]]; then
+    cp ./usr/inittab /etc/
+  fi
+  touch ./.have_installed
+  echo "gpio:resistance:35:90:480:320" > ./.have_installed
+
+  if [[ "$deb_version" < "13.1" ]]; then
+    if [[ "$deb_version" < "12.10" ]]; then
+      apt-get update
+    fi
+    wget --spider -q -o /dev/null --tries=1 -T 10 https://cmake.org/
+    if [ $? -eq 0 ]; then
+      apt-get install cmake libraspberrypi-dev -y 2> error_output.txt
+      result=`cat ./error_output.txt`
+      echo -e "\033[31m$result\033[0m"
+      grep -q "^E:" ./error_output.txt
+      type cmake > /dev/null 2>&1
+      if [ $? -eq 0 ]; then
+        rm -rf rpi-fbcp
+        wget --spider -q -o /dev/null --tries=1 -T 10 https://github.com
+        if [ $? -eq 0 ]; then
+          git clone https://github.com/tasanakorn/rpi-fbcp
+          if [ $? -ne 0 ]; then
+            echo "download fbcp failed, copy native fbcp!!!"
+            cp -r ./usr/rpi-fbcp .
+          fi
+        else
+          echo "bad network, copy native fbcp!!!"
+          cp -r ./usr/rpi-fbcp .
+        fi
+        mkdir ./rpi-fbcp/build
+        cd ./rpi-fbcp/build/
+        cmake ..
+        make
+        install fbcp /usr/local/bin/fbcp
+        cd - > /dev/null
+        type fbcp > /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+          if [[ "$deb_version" < "12.1" ]]; then
+            cp -rf ./usr/99-fbturbo-fbcp.conf  /usr/share/X11/xorg.conf.d/99-fbturbo.conf
+          fi
+          cp -rf ./etc/rc.local /etc/rc.local
+        fi
+      else
+        echo "install cmake error!!!!"
+      fi
+    else
+      echo "bad network, can't install cmake!!!"
+    fi
+  fi
+
+  version=`uname -v`
+  input_result=0
+  version=${version##*(}
+  version=${version%%-*}
+  echo $version
+  if test $version -lt 2017;then
+    echo "reboot"
+  else
+    echo "need to update touch configuration"
+    wget --spider -q -o /dev/null --tries=1 -T 10 http://mirrors.zju.edu.cn/raspbian/raspbian
+    if [ $? -ne 0 ]; then
+      input_result=1
+    else
+      apt-get install xserver-xorg-input-evdev  2> error_output.txt
+      dpkg -l | grep xserver-xorg-input-evdev > /dev/null 2>&1
+      if [ $? -ne 0 ]; then
+        input_result=1
+      fi
+    fi
+    if [ $input_result -eq 1 ]; then
+      if [ $hardware_arch -eq 32 ]; then
+        dpkg -i -B ./xserver-xorg-input-evdev_1%3a2.10.6-1+b1_armhf.deb 2> error_output.txt
+      elif [ $hardware_arch -eq 64 ]; then
+        dpkg -i -B ./xserver-xorg-input-evdev_1%3a2.10.6-2_arm64.deb 2> error_output.txt
+      fi
+    fi
+    result=`cat ./error_output.txt`
+    echo -e "\033[31m$result\033[0m"
+    grep -q "error:" ./error_output.txt && exit
+    cp -rf /usr/share/X11/xorg.conf.d/10-evdev.conf /usr/share/X11/xorg.conf.d/45-evdev.conf
+  fi
+
+  cp ./LCD35-calibrate-touch /usr/local/bin/LCD35-calibrate-touch
+  chmod +x /usr/local/bin/LCD35-calibrate-touch
+  cp ./usr/local/bin/lcd35-preinit.sh /usr/local/bin/lcd35-preinit.sh
+  chmod +x /usr/local/bin/lcd35-preinit.sh
+  cp ./etc/systemd/system/lcd35-preinit.service /etc/systemd/system/lcd35-preinit.service
+  systemctl daemon-reload
+  systemctl enable lcd35-preinit.service
+}
+
+main_install_flow() {
+  check_spi_enabled
+  install_files
+
+  sync
+  sync
+  sleep 1
+
+  if ! verify_display_with_retries; then
+    log "Display failed verification; aborting reboot"
+    exit 1
+  fi
+
+  if [ -n "$ROTATION_ARG" ]; then
+    ./rotate.sh "$ROTATION_ARG"
+  fi
+
+  echo "reboot now"
+  reboot
+}
+
+ROTATION_ARG=""
+VERIFY_ONLY=0
+DRY_RUN=0
+UNINSTALL=0
+RECALIBRATE=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --verify) VERIFY_ONLY=1 ;;
+    --dry-run) DRY_RUN=1 ;;
+    --uninstall) UNINSTALL=1 ;;
+    --recalibrate) RECALIBRATE=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) ROTATION_ARG="$1" ;;
+  esac
+  shift
+done
+
+require_root
+
+if [ $DRY_RUN -eq 1 ]; then
+  echo "Dry run: would install LCD35 stack, enable SPI, copy overlays, install services, verify display, and reboot."
+  exit 0
 fi
 
-if [[ "$deb_version" = "13.1" ]] || [[ "$deb_version" > "13.1" ]]; then
-sudo cp -rf ./usr/99-fbturbo-fbcp.conf  /usr/share/X11/xorg.conf.d/99-fbturbo.~
-sudo cp -rf ./etc/.bash_profile /home/$username/
-
-#sudo cp -rf ./etc/rc_x11.local /etc/rc.local
+if [ $UNINSTALL -eq 1 ]; then
+  perform_uninstall
+  exit $?
 fi
 
-#if test "$root_dev" = "/dev/mmcblk0p7";then
-#sudo cp ./usr/cmdline.txt-noobs /boot/cmdline.txt
-#else
-#sudo cp ./usr/cmdline.txt /boot/
-#fi
-if [[ "$deb_version" < "13.1" ]]; then
-sudo cp ./usr/inittab /etc/
-fi
-#sudo cp ./boot/config-35.txt /boot/config.txt
-sudo touch ./.have_installed
-echo "gpio:resistance:35:90:480:320" > ./.have_installed
-
-if [[ "$deb_version" < "13.1" ]]; then
-if [[ "$deb_version" < "12.10" ]]; then
-sudo apt-get update
-fi
-#FBCP install
-wget --spider -q -o /dev/null --tries=1 -T 10 https://cmake.org/
-if [ $? -eq 0 ]; then
-#sudo apt-get update
-sudo apt-get install cmake libraspberrypi-dev -y 2> error_output.txt
-result=`cat ./error_output.txt`
-echo -e "\033[31m$result\033[0m"
-grep -q "^E:" ./error_output.txt
-type cmake > /dev/null 2>&1
-if [ $? -eq 0 ]; then
-sudo rm -rf rpi-fbcp
-wget --spider -q -o /dev/null --tries=1 -T 10 https://github.com
-if [ $? -eq 0 ]; then
-sudo git clone https://github.com/tasanakorn/rpi-fbcp
-if [ $? -ne 0 ]; then
-echo "download fbcp failed, copy native fbcp!!!"
-sudo cp -r ./usr/rpi-fbcp .
-fi
-else
-echo "bad network, copy native fbcp!!!"
-sudo cp -r ./usr/rpi-fbcp .
-fi
-sudo mkdir ./rpi-fbcp/build
-cd ./rpi-fbcp/build/
-sudo cmake ..
-sudo make
-sudo install fbcp /usr/local/bin/fbcp
-cd - > /dev/null
-type fbcp > /dev/null 2>&1
-if [ $? -eq 0 ]; then
-if [[ "$deb_version" < "12.1" ]]; then
-sudo cp -rf ./usr/99-fbturbo-fbcp.conf  /usr/share/X11/xorg.conf.d/99-fbturbo.conf
-fi
-sudo cp -rf ./etc/rc.local /etc/rc.local
-fi
-else
-echo "install cmake error!!!!"
-fi
-else
-echo "bad network, can't install cmake!!!"
-fi
+if [ $RECALIBRATE -eq 1 ]; then
+  ./LCD35-calibrate-touch
+  exit $?
 fi
 
-#evdev install
-#nodeplatform=`uname -n`
-#kernel=`uname -r`
-version=`uname -v`
-#if test "$nodeplatform" = "raspberrypi";then
-#echo "this is raspberrypi kernel"
-input_result=0
-version=${version##*(}
-version=${version%%-*} 
-echo $version
-if test $version -lt 2017;then
-echo "reboot"
-else
-echo "need to update touch configuration"
-wget --spider -q -o /dev/null --tries=1 -T 10 http://mirrors.zju.edu.cn/raspbian/raspbian
-if [ $? -ne 0 ]; then
-input_result=1
-else
-sudo apt-get install xserver-xorg-input-evdev  2> error_output.txt
-dpkg -l | grep xserver-xorg-input-evdev > /dev/null 2>&1
-if [ $? -ne 0 ]; then
-input_result=1
-fi
-fi
-if [ $input_result -eq 1 ]; then 
-if [ $hardware_arch -eq 32 ]; then
-sudo dpkg -i -B ./xserver-xorg-input-evdev_1%3a2.10.6-1+b1_armhf.deb 2> error_output.txt
-elif [ $hardware_arch -eq 64 ]; then
-sudo dpkg -i -B ./xserver-xorg-input-evdev_1%3a2.10.6-2_arm64.deb 2> error_output.txt
-fi
-fi
-result=`cat ./error_output.txt`
-echo -e "\033[31m$result\033[0m"
-grep -q "error:" ./error_output.txt && exit
-sudo cp -rf /usr/share/X11/xorg.conf.d/10-evdev.conf /usr/share/X11/xorg.conf.d/45-evdev.conf
-#echo "reboot"
-fi
-#else
-#echo "this is not raspberrypi kernel, no need to update touch configure, reboot"
-#fi
-
-sudo sync
-sudo sync
-sleep 1
-if [ $# -eq 1 ]; then
-sudo ./rotate.sh $1
-elif [ $# -gt 1 ]; then
-echo "Too many parameters"
+if [ $VERIFY_ONLY -eq 1 ]; then
+  perform_verification
+  exit $?
 fi
 
-echo "reboot now"
-sudo reboot
+main_install_flow

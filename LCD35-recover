@@ -1,0 +1,76 @@
+#!/bin/bash
+# Full reset and recovery script for the LCD35 display.
+
+set -u
+LOG_FILE="/var/log/lcd35-init.log"
+mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null
+
+timestamp() {
+  date -Iseconds
+}
+
+log() {
+  local message="$1"
+  echo "$(timestamp) [recover] $message" | tee -a "$LOG_FILE" > /dev/null
+}
+
+safe_stop_service() {
+  local service_name="$1"
+  if command -v systemctl >/dev/null 2>&1 && systemctl list-units --type=service | grep -q "^${service_name}\.service"; then
+    log "Stopping ${service_name} service"
+    systemctl stop "$service_name" 2>/dev/null || true
+  fi
+}
+
+safe_start_service() {
+  local service_name="$1"
+  if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files | grep -q "^${service_name}\.service"; then
+    log "Starting ${service_name} service"
+    systemctl start "$service_name" 2>/dev/null || true
+  fi
+}
+
+unload_modules() {
+  for module in fb_ili9486 ads7846 fbtft_device fbtft; do
+    if lsmod | grep -q "^${module}\\b"; then
+      log "Removing module ${module}"
+      modprobe -r "$module" 2>/dev/null || true
+    fi
+  done
+}
+
+load_modules() {
+  log "Loading fbtft_device with LCD35 parameters"
+  modprobe fbtft_device name=flexfb gpios=reset:25,dc:24 speed=16000000 bgr=1 fps=30 2>/dev/null || true
+  log "Loading fb_ili9486"
+  modprobe fb_ili9486 2>/dev/null || true
+}
+
+refresh_framebuffer() {
+  if [ -e /dev/fb1 ]; then
+    log "Clearing framebuffer"
+    dd if=/dev/zero of=/dev/fb1 bs=153600 count=1 status=none conv=fsync 2>/dev/null || true
+    sleep 1
+    log "Setting geometry to 480x320"
+    fbset -fb /dev/fb1 -g 480 320 480 320 16 2>/dev/null || true
+  else
+    log "/dev/fb1 missing after module load"
+  fi
+}
+
+main() {
+  echo "Attempting LCD35 recovery..."
+  log "Starting recovery sequence"
+
+  safe_stop_service lightdm
+  unload_modules
+  sleep 2
+  load_modules
+  refresh_framebuffer
+  safe_start_service lightdm
+
+  echo "Recovery complete. Check display."
+  log "Recovery sequence finished"
+}
+
+main "$@"

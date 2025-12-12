@@ -41,6 +41,24 @@ Update: <br>
 Update: <br>
   v1.1-20160815<br><br>
 
+## LCD35 reliability helpers
+For the 3.5" SPI-based LCD35 panel, additional tooling is included to help with power-loss recovery and troubleshooting:
+
+- `LCD35-diagnose` runs a series of framebuffer, module, X server, and touch checks, logging details to `/var/log/lcd35-init.log`.
+- `LCD35-recover` performs a full module reload, framebuffer reset, and optional LightDM restart to bring the display back after a bad boot.
+- `usr/local/bin/lcd35-watchdog.sh` and `etc/systemd/system/lcd35-watchdog.service` provide a watchdog loop that periodically tests `/dev/fb1` and triggers recovery if the framebuffer stops responding.
+- `LCD35-calibrate-touch` launches an interactive four-point calibration window on the LCD, calculates the X.Org transformation matrix, and writes it to `/usr/share/X11/xorg.conf.d/99-calibration.conf`.
+- `usr/local/bin/lcd35-preinit.sh` and `etc/systemd/system/lcd35-preinit.service` verify the framebuffer is responsive before LightDM starts and attempt recovery if needed.
+
+Copy the scripts to `/usr/local/bin` (or run them from this repository) and enable the watchdog with `sudo systemctl enable --now lcd35-watchdog.service` after installing the service unit.
+
+The `LCD35-show` installer now supports additional flags:
+
+- `--dry-run` to list the steps without changing the system.
+- `--verify` to test `/dev/fb1` initialization with retries.
+- `--uninstall` to restore HDMI output and disable LCD35 helpers.
+- `--recalibrate` to invoke the touch calibration workflow.
+
 
 # How to install the LCD driver of Raspberry Pi
   

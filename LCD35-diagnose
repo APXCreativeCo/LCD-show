@@ -1,0 +1,178 @@
+#!/bin/bash
+# Comprehensive diagnostic helper for the LCD35 panel.
+# This script focuses on observable health checks so that silent failures are easier to spot.
+
+set -u
+
+LOG_FILE="/var/log/lcd35-init.log"
+mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null
+
+timestamp() {
+  date -Iseconds
+}
+
+log() {
+  local message="$1"
+  echo "$(timestamp) [diagnose] $message" | tee -a "$LOG_FILE" > /dev/null
+}
+
+status_line() {
+  local label="$1"
+  local status="$2"
+  local detail="$3"
+  printf "%-28s %s %s\n" "$label" "$status" "$detail"
+}
+
+check_spi() {
+  if grep -q "^[[:space:]]*dtparam=spi=on" /boot/config.txt 2>/dev/null; then
+    status_line "SPI configuration" "✓" "Enabled"
+    log "SPI dtparam present in /boot/config.txt"
+  else
+    status_line "SPI configuration" "✗" "Enable SPI via raspi-config"
+    log "SPI dtparam missing; display cannot initialize without SPI"
+    return 1
+  fi
+}
+
+check_modules() {
+  local ok=0
+  for module in fbtft fb_ili9486 ads7846; do
+    if lsmod | grep -q "^${module}\\b"; then
+      status_line "Kernel module: ${module}" "✓" "Loaded"
+      log "Module ${module} is loaded"
+    else
+      status_line "Kernel module: ${module}" "✗" "Not loaded"
+      log "Module ${module} is missing"
+      ok=1
+    fi
+  done
+  return $ok
+}
+
+check_framebuffer_device() {
+  if [ -e /dev/fb1 ]; then
+    if [ -w /dev/fb1 ]; then
+      status_line "Framebuffer node" "✓" "/dev/fb1 present"
+      log "Framebuffer /dev/fb1 detected"
+    else
+      status_line "Framebuffer node" "✗" "/dev/fb1 not writable"
+      log "Framebuffer /dev/fb1 exists but is not writable"
+      return 1
+    fi
+  else
+    status_line "Framebuffer node" "✗" "/dev/fb1 missing"
+    log "/dev/fb1 is not present; driver did not create device"
+    return 1
+  fi
+  return 0
+}
+
+write_test_pattern() {
+  local tmp_pattern
+  tmp_pattern=$(mktemp)
+  # Create a small alternating pattern to make sure the controller accepts writes.
+  printf '\xFF\x00\xFF\x00\xFF\x00\xFF\x00' > "$tmp_pattern"
+  if dd if="$tmp_pattern" of=/dev/fb1 bs=8 count=1 conv=fsync status=none 2>/dev/null; then
+    status_line "Framebuffer write" "✓" "Pattern written"
+    log "Framebuffer accepted a small write pattern"
+    rm -f "$tmp_pattern"
+    return 0
+  else
+    status_line "Framebuffer write" "✗" "Write failed"
+    log "Writing to /dev/fb1 failed; display may be unresponsive"
+    rm -f "$tmp_pattern"
+    return 1
+  fi
+}
+
+readback_test() {
+  local tmp_read
+  tmp_read=$(mktemp)
+  if dd if=/dev/fb1 of="$tmp_read" bs=8 count=1 status=none 2>/dev/null; then
+    status_line "Framebuffer read" "✓" "Read succeeded"
+    log "Framebuffer returned data during readback"
+    rm -f "$tmp_read"
+    return 0
+  else
+    status_line "Framebuffer read" "✗" "Read failed"
+    log "Reading from /dev/fb1 failed"
+    rm -f "$tmp_read"
+    return 1
+  fi
+}
+
+check_touch() {
+  local touch_detected=1
+  if grep -qi "ADS7846" /proc/bus/input/devices 2>/dev/null; then
+    touch_detected=0
+  elif command -v xinput >/dev/null 2>&1 && xinput list | grep -qi "ADS7846"; then
+    touch_detected=0
+  fi
+
+  if [ $touch_detected -eq 0 ]; then
+    status_line "Touch controller" "✓" "ADS7846 detected"
+    log "Touch controller detected in input devices"
+    return 0
+  else
+    status_line "Touch controller" "✗" "Not detected"
+    log "Touch controller missing from input devices"
+    return 1
+  fi
+}
+
+check_x_server() {
+  if pgrep Xorg >/dev/null 2>&1; then
+    local xrandr_output
+    if xrandr_output=$(DISPLAY=${DISPLAY:-:0} xrandr 2>/dev/null); then
+      if echo "$xrandr_output" | grep -q "480x320"; then
+        status_line "X server" "✓" "Running at 480x320"
+        log "X server reports 480x320 resolution"
+      else
+        status_line "X server" "✗" "Unexpected resolution"
+        log "X server running but did not report 480x320"
+        return 1
+      fi
+    else
+      status_line "X server" "✗" "No response"
+      log "X server running but xrandr query failed"
+      return 1
+    fi
+  else
+    status_line "X server" "✗" "Not running"
+    log "X server not running"
+    return 1
+  fi
+  return 0
+}
+
+main() {
+  echo "LCD35 diagnostic report"
+  echo "-----------------------"
+
+  local failures=0
+
+  check_spi || failures=$((failures+1))
+  check_modules || failures=$((failures+1))
+  check_framebuffer_device || failures=$((failures+1))
+
+  # Only attempt read/write if device is present and writable.
+  if [ -w /dev/fb1 ]; then
+    write_test_pattern || failures=$((failures+1))
+    readback_test || failures=$((failures+1))
+  fi
+
+  check_touch || failures=$((failures+1))
+  check_x_server || failures=$((failures+1))
+
+  echo
+  if [ $failures -eq 0 ]; then
+    echo "All checks passed."
+    log "Diagnostic completed successfully"
+  else
+    echo "$failures check(s) failed. Review log at $LOG_FILE."
+    log "Diagnostic found ${failures} failing area(s)"
+  fi
+  return $failures
+}
+
+main "$@"
