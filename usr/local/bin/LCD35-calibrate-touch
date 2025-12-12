@@ -1,0 +1,85 @@
+#!/bin/bash
+# Interactive touchscreen calibration helper for the LCD35 panel.
+# Uses xinput_calibrator to draw four corner targets, captures the
+# resulting transformation matrix, and saves it for X.Org.
+
+set -euo pipefail
+
+LOG_FILE="/var/log/lcd35-init.log"
+mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null
+
+log() {
+  echo "$(date -Iseconds) [calibrate] $1" | tee -a "$LOG_FILE" > /dev/null
+}
+
+usage() {
+  cat <<'USAGE'
+Usage: LCD35-calibrate-touch
+
+Runs xinput_calibrator against the ADS7846 touchscreen and writes the
+resulting configuration to /usr/share/X11/xorg.conf.d/99-calibration.conf.
+Make sure the LCD display and X server are running before invoking this tool.
+USAGE
+}
+
+if [[ ${1-} == "-h" || ${1-} == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+if [ "$EUID" -ne 0 ]; then
+  echo "Please run as root (sudo LCD35-calibrate-touch)." >&2
+  exit 1
+fi
+
+DISPLAY=${DISPLAY:-:0}
+export DISPLAY
+
+ensure_calibrator() {
+  if command -v xinput_calibrator >/dev/null 2>&1; then
+    return 0
+  fi
+
+  log "xinput_calibrator missing; attempting installation"
+  if apt-get update -y >/dev/null 2>&1 && apt-get install -y xinput-calibrator >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local arch
+  arch=$(dpkg --print-architecture 2>/dev/null || echo "")
+  if [ "$arch" = "armhf" ] && [ -f ./xinput-calibrator_0.7.5-1_armhf.deb ]; then
+    dpkg -i -B ./xinput-calibrator_0.7.5-1_armhf.deb >/dev/null 2>&1 && return 0
+  elif [ "$arch" = "arm64" ] && [ -f ./xinput-calibrator_0.7.5+git20140201-1+b2_arm64.deb ]; then
+    dpkg -i -B ./xinput-calibrator_0.7.5+git20140201-1+b2_arm64.deb >/dev/null 2>&1 && return 0
+  fi
+
+  echo "Unable to install xinput_calibrator automatically." >&2
+  exit 1
+}
+
+ensure_x_running() {
+  if pgrep Xorg >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "X server is not running; start your desktop session before calibrating." >&2
+  exit 1
+}
+
+ensure_calibrator
+ensure_x_running
+
+log "Starting touchscreen calibration"
+echo "A calibration window will appear on the LCD. Touch each crosshair as it appears."
+
+calibration_output=$(xinput_calibrator --output-type xorg.conf.d 2>/tmp/lcd35-calibrate.stderr)
+status=$?
+if [ $status -ne 0 ] || [ -z "$calibration_output" ]; then
+  echo "Calibration failed. See /tmp/lcd35-calibrate.stderr for details." >&2
+  log "Calibration failed with status $status"
+  exit 1
+fi
+
+echo "$calibration_output" | tee /usr/share/X11/xorg.conf.d/99-calibration.conf >/dev/null
+log "Saved calibration matrix to /usr/share/X11/xorg.conf.d/99-calibration.conf"
+
+echo "Calibration complete. Restart X (or reboot) for changes to apply."

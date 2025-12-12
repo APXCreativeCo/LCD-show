@@ -1,0 +1,14 @@
+[Unit]
+Description=LCD35 Display Pre-Init
+Before=lightdm.service
+After=systemd-modules-load.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/lcd35-preinit.sh
+RemainAfterExit=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
