@@ -120,6 +120,14 @@ install_files() {
   cp ./usr/tft35a-overlay.dtb /boot/overlays/
   cp ./usr/tft35a-overlay.dtb /boot/overlays/tft35a.dtbo
 
+  cp ./etc/X11/xorg.conf.d/99-fbdev.conf /etc/X11/xorg.conf.d/99-fbdev.conf
+  if [ ! -f /etc/X11/xorg.conf.d/99-fbdev.conf ]; then
+    log "Failed to install fbdev Xorg configuration"
+    echo "X server failed to start - check /var/log/lightdm/lightdm.log" >&2
+    exit 1
+  fi
+  log "Installed fbdev Xorg configuration targeting /dev/fb1"
+
   source ./system_config.sh
 
   echo "hdmi_force_hotplug=1" >> ./boot/config.txt.bak
@@ -236,6 +244,33 @@ install_files() {
   systemctl enable lcd35-preinit.service
 }
 
+restart_lightdm_and_verify() {
+  if ! command -v systemctl >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if ! systemctl list-unit-files | grep -q '^lightdm.service'; then
+    log "lightdm not installed; skipping X server verification"
+    return 0
+  fi
+
+  log "Restarting lightdm to apply framebuffer configuration"
+  if ! systemctl restart lightdm.service; then
+    log "Failed to restart lightdm"
+    return 1
+  fi
+
+  sleep 2
+  if pgrep -x Xorg >/dev/null 2>&1; then
+    log "X server running after lightdm restart"
+    return 0
+  fi
+
+  log "X server failed to start after lightdm restart"
+  echo "X server failed to start - check /var/log/lightdm/lightdm.log" >&2
+  return 1
+}
+
 main_install_flow() {
   check_spi_enabled
   install_files
@@ -246,6 +281,11 @@ main_install_flow() {
 
   if ! verify_display_with_retries; then
     log "Display failed verification; aborting reboot"
+    exit 1
+  fi
+
+  if ! restart_lightdm_and_verify; then
+    log "X server verification failed; aborting reboot"
     exit 1
   fi
 
