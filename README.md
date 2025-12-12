@@ -41,6 +41,15 @@ Update: <br>
 Update: <br>
   v1.1-20160815<br><br>
 
+## LCD35 reliability helpers
+For the 3.5" SPI-based LCD35 panel, additional tooling is included to help with power-loss recovery and troubleshooting:
+
+- `LCD35-diagnose` runs a series of framebuffer, module, X server, and touch checks, logging details to `/var/log/lcd35-init.log`.
+- `LCD35-recover` performs a full module reload, framebuffer reset, and optional LightDM restart to bring the display back after a bad boot.
+- `usr/local/bin/lcd35-watchdog.sh` and `etc/systemd/system/lcd35-watchdog.service` provide a watchdog loop that periodically tests `/dev/fb1` and triggers recovery if the framebuffer stops responding.
+
+Copy the scripts to `/usr/local/bin` (or run them from this repository) and enable the watchdog with `sudo systemctl enable --now lcd35-watchdog.service` after installing the service unit.
+
 
 # How to install the LCD driver of Raspberry Pi
   
